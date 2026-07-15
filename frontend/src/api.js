@@ -1,6 +1,6 @@
 import axios from 'axios'
 
-const api = axios.create({ baseURL: '/api', timeout: 15000 })
+const api = axios.create({ baseURL: import.meta.env.VITE_API_URL || '/api', timeout: 15000 })
 
 export const getTrend = (days = 365) => api.get(`/historical/trend?days=${days}`).then(r => r.data)
 export const getSeasonal = () => api.get('/historical/seasonal').then(r => r.data)
