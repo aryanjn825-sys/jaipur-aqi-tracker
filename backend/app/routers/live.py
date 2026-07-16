@@ -28,9 +28,21 @@ async def get_live_aqi(city: str = "Jaipur"):
     station = CITY_STATIONS.get(city, city.lower())
     url = f"https://api.waqi.info/feed/{station}/?token={WAQI_TOKEN}"
 
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(url)
-        data = resp.json()
+    last_error = None
+    data = None
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(url)
+            data = resp.json()
+            break
+        except httpx.TimeoutException:
+            last_error = "WAQI request timed out"
+        except httpx.RequestError as e:
+            last_error = f"WAQI network error: {e}"
+
+    if data is None:
+        raise HTTPException(status_code=502, detail=last_error or "WAQI request failed")
 
     if data.get("status") != "ok":
         raise HTTPException(status_code=502, detail=f"WAQI error: {data.get('data')}")
@@ -58,33 +70,45 @@ async def get_live_weather(lat: float = JAIPUR_LAT, lon: float = JAIPUR_LON):
         "&hourly=temperature_2m,relative_humidity_2m,wind_speed_10m"
         "&timezone=Asia%2FKolkata&forecast_days=2"
     )
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(url)
-        if resp.status_code != 200:
-            raise HTTPException(status_code=502, detail="Open-Meteo request failed")
-        data = resp.json()
 
-    current = data.get("current", {})
-    return {
-        "temperature_c": current.get("temperature_2m"),
-        "humidity_pct": current.get("relative_humidity_2m"),
-        "wind_speed_kmh": current.get("wind_speed_10m"),
-        "pressure_hpa": current.get("surface_pressure"),
-        "precipitation_mm": current.get("precipitation"),
-        "updated": current.get("time"),
-        "hourly_forecast": data.get("hourly"),
-    }
+    last_error = None
+    for attempt in range(2):  # try once, retry once on transient failure
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(url)
+            if resp.status_code == 200:
+                data = resp.json()
+                current = data.get("current", {})
+                return {
+                    "temperature_c": current.get("temperature_2m"),
+                    "humidity_pct": current.get("relative_humidity_2m"),
+                    "wind_speed_kmh": current.get("wind_speed_10m"),
+                    "pressure_hpa": current.get("surface_pressure"),
+                    "precipitation_mm": current.get("precipitation"),
+                    "updated": current.get("time"),
+                    "hourly_forecast": data.get("hourly"),
+                }
+            last_error = f"Open-Meteo returned HTTP {resp.status_code}: {resp.text[:200]}"
+        except httpx.TimeoutException:
+            last_error = "Open-Meteo request timed out"
+        except httpx.RequestError as e:
+            last_error = f"Open-Meteo network error: {e}"
+
+    raise HTTPException(status_code=502, detail=last_error or "Open-Meteo request failed")
 
 
 @router.get("/combined")
 async def get_combined(city: str = "Jaipur"):
     """AQI + weather in a single call, for the dashboard hero section."""
-    aqi_data, weather_data, aqi_error = None, None, None
+    aqi_data, weather_data, aqi_error, weather_error = None, None, None, None
     try:
         aqi_data = await get_live_aqi(city)
-    except HTTPException as e:
-        aqi_error = e.detail
+    except Exception as e:
+        aqi_error = str(e) if not isinstance(e, HTTPException) else e.detail
 
-    weather_data = await get_live_weather()
+    try:
+        weather_data = await get_live_weather()
+    except Exception as e:
+        weather_error = str(e) if not isinstance(e, HTTPException) else e.detail
 
-    return {"aqi": aqi_data, "aqi_error": aqi_error, "weather": weather_data}
+    return {"aqi": aqi_data, "aqi_error": aqi_error, "weather": weather_data, "weather_error": weather_error}
