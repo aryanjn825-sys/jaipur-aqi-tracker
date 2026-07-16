@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException
 router = APIRouter()
 
 WAQI_TOKEN = os.environ.get("WAQI_TOKEN", "")
+WEATHERAPI_KEY = os.environ.get("WEATHERAPI_KEY", "")
 JAIPUR_LAT = 26.9124
 JAIPUR_LON = 75.7873
 
@@ -81,20 +82,23 @@ async def get_live_aqi(city: str = "Jaipur"):
 
 @router.get("/weather")
 async def get_live_weather(lat: float = JAIPUR_LAT, lon: float = JAIPUR_LON):
-    """Live + hourly forecast weather from Open-Meteo (free, no API key required).
-    Cached for 15 minutes per coordinate pair to stay well under Open-Meteo's shared-IP rate limit."""
+    """Live weather from WeatherAPI.com (free tier, per-account key — not shared-IP rate limited
+    like Open-Meteo can be on platforms like Render/Vercel). Requires WEATHERAPI_KEY env var
+    (free at weatherapi.com/signup.aspx). Cached for 15 minutes per coordinate pair."""
     cache_key = (round(lat, 4), round(lon, 4))
     cached = _weather_cache.get(cache_key)
     if cached and (time.time() - cached[0]) < _WEATHER_CACHE_TTL:
         return cached[1]
 
-    url = (
-        "https://api.open-meteo.com/v1/forecast"
-        f"?latitude={lat}&longitude={lon}"
-        "&current=temperature_2m,relative_humidity_2m,wind_speed_10m,surface_pressure,precipitation"
-        "&hourly=temperature_2m,relative_humidity_2m,wind_speed_10m"
-        "&timezone=Asia%2FKolkata&forecast_days=2"
-    )
+    if not WEATHERAPI_KEY:
+        if cached:
+            return cached[1]
+        raise HTTPException(
+            status_code=503,
+            detail="WEATHERAPI_KEY not configured on the server. Get a free key at https://www.weatherapi.com/signup.aspx and set it as an environment variable.",
+        )
+
+    url = f"https://api.weatherapi.com/v1/current.json?key={WEATHERAPI_KEY}&q={lat},{lon}&aqi=no"
 
     last_error = None
     for attempt in range(2):  # try once, retry once on transient failure
@@ -105,27 +109,28 @@ async def get_live_weather(lat: float = JAIPUR_LAT, lon: float = JAIPUR_LON):
                 data = resp.json()
                 current = data.get("current", {})
                 result = {
-                    "temperature_c": current.get("temperature_2m"),
-                    "humidity_pct": current.get("relative_humidity_2m"),
-                    "wind_speed_kmh": current.get("wind_speed_10m"),
-                    "pressure_hpa": current.get("surface_pressure"),
-                    "precipitation_mm": current.get("precipitation"),
-                    "updated": current.get("time"),
-                    "hourly_forecast": data.get("hourly"),
+                    "temperature_c": current.get("temp_c"),
+                    "humidity_pct": current.get("humidity"),
+                    "wind_speed_kmh": current.get("wind_kph"),
+                    "pressure_hpa": current.get("pressure_mb"),
+                    "precipitation_mm": current.get("precip_mm"),
+                    "updated": current.get("last_updated"),
+                    "condition": (current.get("condition") or {}).get("text"),
+                    "hourly_forecast": None,  # not fetched on the free current.json endpoint
                 }
                 _weather_cache[cache_key] = (time.time(), result)
                 return result
-            last_error = f"Open-Meteo returned HTTP {resp.status_code}: {resp.text[:200]}"
+            last_error = f"WeatherAPI returned HTTP {resp.status_code}: {resp.text[:200]}"
         except httpx.TimeoutException:
-            last_error = "Open-Meteo request timed out"
+            last_error = "WeatherAPI request timed out"
         except httpx.RequestError as e:
-            last_error = f"Open-Meteo network error: {e}"
+            last_error = f"WeatherAPI network error: {e}"
 
     # If we have a stale cached value, serve it rather than fail outright
     if cached:
         return cached[1]
 
-    raise HTTPException(status_code=502, detail=last_error or "Open-Meteo request failed")
+    raise HTTPException(status_code=502, detail=last_error or "WeatherAPI request failed")
 
 
 @router.get("/combined")
